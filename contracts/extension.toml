@@ -1,0 +1,79 @@
+# =============================================================================
+# EXAMPLE ORG EXTENSION  --  "Acme" overlay on the base AAP-ops contracts
+# -----------------------------------------------------------------------------
+# This file holds DELTAS ONLY. It inherits every base contract from rules.toml
+# and reshapes specific ones by id. Copy this into a repo and edit; never edit
+# rules.toml to fit one repo.
+# Merge semantics: ../references/contract-schema.md  (load base -> config ->
+# overrides -> disables -> new contracts)
+# =============================================================================
+
+schema_version = 1
+inherits = "rules.toml"
+
+[meta]
+name = "acme-aap-ops"
+version = "1.0.0"
+owner = "acme-platform-team"
+
+# --- config overrides ----------------------------------------------------------
+# Acme runs AAP 2.5 but mirrors all images through an internal registry and
+# treats EE python pinning as a hard gate.
+[config]
+approved_registries = ["registry.acme.internal", "registry.redhat.io"]
+
+# --- overrides: tighten / adjust inherited contracts ---------------------------
+
+# Acme treats unpinned python deps as a release blocker, not a warning.
+[[override]]
+id = "AAP-EE-004"
+severity = "error"
+
+# Acme enforces content signing strictly and has an automatable check, so it
+# upgrades the base manual control to an error and points it at proof-in-repo.
+[[override]]
+id = "AAP-GOV-005"
+severity = "error"
+
+# --- disables: switch off inherited contracts (reason REQUIRED, audited) --------
+
+# Audit log shipping is owned centrally and verified outside this repo.
+[[disable]]
+id = "AAP-GOV-006"
+reason = "Activity-stream forwarding is configured and monitored by the central SIEM team at the platform level; it is not provable from this repo and is attested in the platform runbook RB-114."
+
+# --- new contracts: Acme-specific rules in the ACME namespace -------------------
+
+[[contract]]
+id = "ACME-API-100"
+domain = "api"
+title = "Pin the Acme internal CA bundle"
+severity = "error"
+statement = "Python API clients MUST verify against the Acme internal CA bundle, referenced via the ACME_CA_BUNDLE environment variable."
+rationale = "Acme's control plane uses an internal CA; trusting the public bundle would reject valid hosts and tempt engineers to disable verification entirely (see AAP-API-004)."
+applies_to = ["script"]
+refs = ["https://wiki.acme.internal/pki/ca-bundle"]
+  [contract.check]
+  type = "regex_present"
+  target = "**/*.py"
+  pattern = "ACME_CA_BUNDLE"
+  message = "Python API client does not reference ACME_CA_BUNDLE."
+  [contract.fix]
+  text = "Pass verify=os.environ['ACME_CA_BUNDLE'] to every requests/session call against the controller."
+
+[[contract]]
+id = "ACME-EE-101"
+domain = "ee"
+title = "EE definitions carry an Acme maintainer label"
+severity = "warn"
+statement = "Execution environments MUST set an `maintainer` label under options so every built image is attributable."
+rationale = "Acme's image-retention policy expires unattributed images; an unlabeled EE gets garbage-collected out from under running templates."
+applies_to = ["ee"]
+refs = ["https://wiki.acme.internal/ee/labels"]
+  [contract.check]
+  type = "regex_present"
+  target = "**/execution-environment.yml"
+  pattern = "(?i)maintainer"
+  message = "EE definition has no maintainer label."
+  [contract.fix]
+  text = "Add options.container_init or additional labels including maintainer=<team> to the EE definition."

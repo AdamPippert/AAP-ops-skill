@@ -1,0 +1,367 @@
+# =============================================================================
+# AAP-OPS BASE CONTRACTS  --  the single source of truth
+# -----------------------------------------------------------------------------
+# This file is read by Claude (each `statement` is an instruction) AND executed
+# by scripts/lint.py (each `check` is a runnable assertion). Do not fork it per
+# repo -- add a contracts/extension.toml with deltas instead.
+# Schema + merge rules: ../references/contract-schema.md
+# =============================================================================
+
+schema_version = 1
+
+[meta]
+name = "aap-ops"
+version = "1.0.0"
+owner = "platform-team"
+
+[config]
+controller_api = "/api/controller/v2"     # AAP 2.5+ automation controller root
+gateway_api    = "/api/gateway/v1"        # AAP 2.5+ platform gateway root
+ee_schema_version = 3                      # ansible-builder v3 EE definition
+ansible_lint_profile = "production"        # strictest stock ansible-lint profile
+max_page_size = 200                        # controller API hard ceiling
+approved_registries = ["registry.redhat.io", "registry.access.redhat.com"]
+
+# =============================================================================
+# DOMAIN: api  --  driving automation controller / platform gateway over REST
+# =============================================================================
+
+[[contract]]
+id = "AAP-API-001"
+domain = "api"
+title = "Use the versioned platform API base path"
+severity = "warn"
+statement = "API clients MUST target the AAP 2.5+ roots (${config.controller_api}, ${config.gateway_api}); do not hardcode the legacy unscoped /api/v2 path."
+rationale = "On the unified platform, controller objects moved under /api/controller/. Code pinned to bare /api/v2 silently breaks after upgrade and masks gateway-only resources entirely."
+applies_to = ["playbook", "script"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/automation_execution_api_overview/index"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*.{yml,yaml,py,sh}"
+  pattern = "/api/v2/"
+  message = "Legacy /api/v2/ path found; use ${config.controller_api} or ${config.gateway_api}."
+  [contract.fix]
+  text = "Replace /api/v2/ with ${config.controller_api}/ (controller objects) or ${config.gateway_api}/ (auth, settings, RBAC). Discover the live root via GET /api/ -> current_version."
+
+[[contract]]
+id = "AAP-API-002"
+domain = "api"
+title = "No hardcoded secrets in API calls"
+severity = "error"
+statement = "Tokens, passwords, and OAuth secrets MUST come from a vault or AAP credential, never literal strings in playbooks or scripts."
+rationale = "A literal token in git is a permanent control-plane breach the moment the repo is cloned, forked, or leaked. Rotation cannot fix what is in history."
+applies_to = ["playbook", "script"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html/automation_execution_api_overview/controller-api-auth-methods"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*.{yml,yaml,py,sh}"
+  pattern = "(?i)(oauth_token|bearer\\s+[a-z0-9]{15,}|password\\s*[:=]\\s*['\"][^'\"{]{6,}['\"]|token\\s*[:=]\\s*['\"][a-z0-9]{20,}['\"])"
+  message = "Hardcoded credential/token literal detected."
+  [contract.fix]
+  text = "Source secrets via lookup('ansible.builtin.env', ...), ansible-vault, or an injected AAP credential. Reference {{ vault_aap_token }}, never the value."
+
+[[contract]]
+id = "AAP-API-003"
+domain = "api"
+title = "Respect the API pagination ceiling"
+severity = "warn"
+statement = "List requests MUST NOT set page_size above ${config.max_page_size}; paginate instead of widening the page."
+rationale = "The controller rejects/clamps page sizes over 200. Code that assumes a bigger page either errors or silently truncates results, producing wrong inventories and partial reconciliation."
+applies_to = ["playbook", "script"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/automation_execution_api_overview/index"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*.{yml,yaml,py,sh}"
+  pattern = "page_size=(2[0-9]{2,}|[3-9][0-9]{2}|[0-9]{4,})"
+  message = "page_size exceeds ${config.max_page_size}."
+  [contract.fix]
+  text = "Use page_size<=${config.max_page_size} and follow the `next` link until null."
+
+[[contract]]
+id = "AAP-API-004"
+domain = "api"
+title = "TLS verification stays on"
+severity = "error"
+statement = "Every AAP API call MUST verify TLS; never disable certificate validation."
+rationale = "Disabling validation turns an authenticated control-plane call into a man-in-the-middle target; a single intercepted run can leak a controller token with broad scope."
+applies_to = ["playbook", "script"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html/automation_execution_api_overview/controller-api-auth-methods"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*.{yml,yaml,py,sh}"
+  pattern = "(?i)(validate_certs:\\s*false|verify\\s*=\\s*False|curl[^\\n]*\\s-k\\b|--insecure)"
+  message = "TLS verification disabled."
+  [contract.fix]
+  text = "Set validate_certs: true / verify=True and install the CA into the EE or system trust store instead of skipping verification."
+
+[[contract]]
+id = "AAP-API-005"
+domain = "api"
+title = "Prefer collection modules over raw uri for controller objects"
+severity = "warn"
+statement = "Manage controller objects with the ansible.controller / awx.awx modules (FQCN), not hand-rolled ansible.builtin.uri calls to the API."
+rationale = "The collection modules are idempotent, handle pagination/auth/version drift, and are supported. Raw uri reimplements all of that badly and breaks on upgrade."
+applies_to = ["playbook"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/automation_execution_api_overview/index"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*.{yml,yaml}"
+  pattern = "(?i)uri:[\\s\\S]{0,200}(/api/controller/|/api/v2/|/api/gateway/)"
+  message = "Raw uri call against the AAP API; use ansible.controller.* modules."
+  [contract.fix]
+  text = "Replace the uri task with the matching ansible.controller module (e.g. ansible.controller.job_template, .inventory, .project)."
+
+[[contract]]
+id = "AAP-API-006"
+domain = "api"
+title = "Control plane reachable and healthy"
+severity = "error"
+statement = "Before driving the API, the controller ping endpoint MUST return healthy."
+rationale = "Launching writes against a degraded/HA-split controller produces partial state that is worse than no run. Fail fast on an unhealthy control plane."
+applies_to = ["live"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/automation_execution_api_overview/index"]
+  [contract.check]
+  type = "http"
+  endpoint = "${config.controller_api}/ping/"
+  op = "status_eq"
+  value = 200
+  message = "Controller ping did not return 200."
+  [contract.fix]
+  text = "Investigate controller/gateway health before retrying. Do not force writes against a failing ping."
+
+# =============================================================================
+# DOMAIN: ee  --  Execution Environments via ansible-builder (v3)
+# =============================================================================
+
+[[contract]]
+id = "AAP-EE-001"
+domain = "ee"
+title = "EE definition declares schema version 3"
+severity = "error"
+statement = "Every execution-environment.yml MUST set version: ${config.ee_schema_version}."
+rationale = "Without an explicit version, ansible-builder assumes v1 and silently ignores v3 sections (additional_build_files, options), producing an EE that omits your intended layers."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "yaml_key"
+  target = "**/execution-environment.yml"
+  path = "version"
+  op = "=="
+  value = 3
+  message = "EE definition missing version: 3."
+  [contract.fix]
+  text = "Add `version: 3` at the top of execution-environment.yml."
+
+[[contract]]
+id = "AAP-EE-002"
+domain = "ee"
+title = "Base image is pinned, never :latest"
+severity = "error"
+statement = "The EE base image MUST be pinned to an explicit tag or digest; :latest is forbidden."
+rationale = "An EE is only reproducible if its base is. :latest means today's green build and tomorrow's broken one share a definition with no diff to blame."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/execution-environment.yml"
+  pattern = ":latest"
+  message = "Base image pinned to :latest."
+  [contract.fix]
+  text = "Pin images.base_image.name to an explicit version tag (e.g. ...:2.16) or, better, a @sha256 digest."
+
+[[contract]]
+id = "AAP-EE-003"
+domain = "ee"
+title = "Galaxy collections are version-pinned"
+severity = "error"
+statement = "Every collection in the EE's galaxy requirements MUST carry a version constraint."
+rationale = "Unpinned collections drift between builds, so the same definition produces different module behavior over time -- the antithesis of an auditable artifact."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "requirements_pinned"
+  target = "**/requirements.yml"
+  message = "Collection without a version pin in requirements.yml."
+  [contract.fix]
+  text = "Add `version:` to each collection entry (e.g. version: \">=2.0.0,<3.0.0\" or an exact tag)."
+
+[[contract]]
+id = "AAP-EE-004"
+domain = "ee"
+title = "Python dependencies are version-pinned"
+severity = "warn"
+statement = "Python packages in the EE requirements MUST use a version specifier (==, ~=, or a bounded range)."
+rationale = "Unbounded pip deps re-resolve on every build; a transitive bump can break a collection's runtime with no change to your repo."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "requirements_pinned"
+  target = "**/requirements.txt"
+  message = "Unpinned Python dependency."
+  [contract.fix]
+  text = "Pin each package (e.g. requests==2.32.3 or requests~=2.32). Generate from a resolved lock where possible."
+
+[[contract]]
+id = "AAP-EE-005"
+domain = "ee"
+title = "Base image comes from an approved registry"
+severity = "error"
+statement = "The EE base image MUST be pulled from an approved registry (${config.approved_registries}), not docker.io or an unvetted source."
+rationale = "Pulling control-plane execution images from arbitrary registries imports unaudited supply-chain risk straight into every job run."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/execution-environment.yml"
+  pattern = "(?i)(docker\\.io/|quay\\.io/(?!ansible/)|index\\.docker\\.io)"
+  message = "Base image from a non-approved registry."
+  [contract.fix]
+  text = "Use a base image from ${config.approved_registries}. Mirror third-party content into an approved registry first if required."
+
+[[contract]]
+id = "AAP-EE-006"
+domain = "ee"
+title = "No unpinned mutation in build steps"
+severity = "warn"
+statement = "additional_build_steps MUST NOT run unpinned package mutation (dnf/yum/apt update, or pip install without a version)."
+rationale = "A `dnf -y update` or bare `pip install foo` inside a build step reintroduces drift you removed everywhere else, defeating pinning."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/execution-environment.yml"
+  pattern = "(?i)((dnf|yum|microdnf|apt(-get)?)\\s+(-y\\s+)?update|pip\\d?\\s+install\\s+(?!.*[=<>~]).*[a-z])"
+  message = "Unpinned package mutation in a build step."
+  [contract.fix]
+  text = "Pin exact versions in build steps, or move the dependency into the declarative dependencies section so it is tracked."
+
+[[contract]]
+id = "AAP-EE-007"
+domain = "ee"
+title = "EE definition builds cleanly"
+severity = "error"
+statement = "ansible-builder MUST be able to generate a build context from the EE definition without error."
+rationale = "A definition that does not even produce a context is broken regardless of how it reads. This is the cheapest end-to-end proof the EE is real."
+applies_to = ["ee"]
+refs = ["https://docs.ansible.com/projects/builder/en/latest/definition/"]
+  [contract.check]
+  type = "command"
+  cmd = "ansible-builder create -f execution-environment.yml -c ._aapops_build_context"
+  message = "ansible-builder create failed."
+  [contract.fix]
+  text = "Run the command locally, read the traceback, and fix the offending section (commonly a bad dependency path or unknown key)."
+
+# =============================================================================
+# DOMAIN: governance  --  compliance controls (auditable, some attested)
+# =============================================================================
+
+[[contract]]
+id = "AAP-GOV-001"
+domain = "governance"
+title = "Automation changes are review-gated"
+severity = "error"
+statement = "The repo MUST define code ownership so AAP changes (job templates, inventories, EEs) require review before merge."
+rationale = "Automation is privileged code. Unreviewed merges to it are unreviewed changes to production infrastructure."
+applies_to = ["repo"]
+refs = ["https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners"]
+  [contract.check]
+  type = "file_present"
+  target = "{CODEOWNERS,.github/CODEOWNERS,docs/CODEOWNERS,.gitlab/CODEOWNERS}"
+  message = "No CODEOWNERS file enforcing review."
+  [contract.fix]
+  text = "Add a CODEOWNERS mapping the automation paths to the platform team and require it in branch protection."
+
+[[contract]]
+id = "AAP-GOV-002"
+domain = "governance"
+title = "No plaintext secrets anywhere in the repo"
+severity = "error"
+statement = "The repository MUST contain no plaintext secrets; all secrets are vaulted or externally injected."
+rationale = "Governance is broader than API call sites (AAP-API-002): secrets leak in vars files, host_vars, group_vars, and CI configs too."
+applies_to = ["repo"]
+refs = ["https://docs.ansible.com/ansible/latest/vault_guide/vault.html"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*.{yml,yaml,env,cfg,ini}"
+  pattern = "(?i)(aws_secret_access_key\\s*[:=]\\s*\\S{16,}|-----BEGIN (RSA |OPENSSH )?PRIVATE KEY-----|api[_-]?key\\s*[:=]\\s*['\"]?[a-z0-9]{20,})"
+  message = "Probable plaintext secret committed."
+  [contract.fix]
+  text = "Move the value into ansible-vault or an AAP credential; purge it from git history; rotate the exposed secret."
+
+[[contract]]
+id = "AAP-GOV-003"
+domain = "governance"
+title = "Sensitive survey fields are encrypted"
+severity = "warn"
+statement = "Survey questions collecting secrets MUST use the password type so values are not stored or echoed in plaintext."
+rationale = "A survey 'password' captured as a text variable lands in job args and the database unencrypted -- a quiet, recurring leak on every launch."
+applies_to = ["playbook", "config"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/using_automation_execution/index"]
+  [contract.check]
+  type = "regex_absent"
+  target = "**/*survey*.{yml,yaml,json}"
+  pattern = "(?i)(variable[\"']?\\s*[:=]\\s*[\"']?\\w*(password|secret|token)\\w*[\"']?[\\s\\S]{0,120}type[\"']?\\s*[:=]\\s*[\"']?text)"
+  message = "Sensitive survey field declared as type text."
+  [contract.fix]
+  text = "Set the survey question type to `password` for any secret-bearing variable."
+
+[[contract]]
+id = "AAP-GOV-004"
+domain = "governance"
+title = "Least-privilege automation accounts"
+severity = "error"
+statement = "Automation service accounts MUST be scoped to the org/team they serve, with no global System Administrator role."
+rationale = "A pipeline credential with platform-wide admin turns any compromised job into total control-plane compromise. Scope limits blast radius."
+applies_to = ["governance"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/access_management_and_authentication/index"]
+  [contract.check]
+  type = "manual"
+  prompt = "Confirm every automation/service account used by this repo is scoped to a single organization or team and holds no global System Administrator role. Record account names and their roles."
+  [contract.fix]
+  text = "Re-scope the account to org/team roles in the gateway RBAC; remove System Administrator."
+
+[[contract]]
+id = "AAP-GOV-005"
+domain = "governance"
+title = "Content signing / verification enabled"
+severity = "warn"
+statement = "Projects and collections consumed by AAP MUST verify signed content (GPG signature verification on, signed collections from hub)."
+rationale = "Unverified content lets a compromised galaxy mirror or git remote inject code into privileged runs. Signing is the supply-chain backstop."
+applies_to = ["governance"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/managing_automation_content/index"]
+  [contract.check]
+  type = "manual"
+  prompt = "Confirm signature verification is enabled for the projects/collections this repo deploys (hub signed collections and/or GPG verification on project sync). Record where it is enforced."
+  [contract.fix]
+  text = "Enable signature verification on the project/credential and require signed collections from automation hub."
+
+[[contract]]
+id = "AAP-GOV-006"
+domain = "governance"
+title = "Audit logging shipped off-box"
+severity = "warn"
+statement = "AAP audit/activity-stream logs MUST be forwarded to a tamper-resistant external store (SIEM)."
+rationale = "Logs that live only on the platform can be erased by whoever compromises it. External shipping preserves the audit trail through an incident."
+applies_to = ["governance"]
+refs = ["https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html-single/configuring_automation_execution/index"]
+  [contract.check]
+  type = "manual"
+  prompt = "Confirm the controller's external logging aggregator is configured and the activity stream is reaching the SIEM. Record the destination."
+  [contract.fix]
+  text = "Configure logging aggregator settings (e.g. splunk/logstash) and verify delivery."
+
+[[contract]]
+id = "AAP-GOV-007"
+domain = "governance"
+title = "Ownership and change traceability"
+severity = "info"
+statement = "Each automation artifact SHOULD declare an owner and reference the change record/ticket that authorized it."
+rationale = "When an audit asks 'who approved this and why', the answer must be in the repo, not in someone's memory."
+applies_to = ["repo"]
+refs = []
+  [contract.check]
+  type = "file_present"
+  target = "{OWNERS,OWNERS.md,docs/ownership.md,.aap-ops/owners.yml}"
+  message = "No ownership/change-traceability record found."
+  [contract.fix]
+  text = "Add an OWNERS/ownership file naming the accountable team and the change-control reference for the automation."
